@@ -62,7 +62,9 @@ aiplatform.init(project=PROJECT_ID, location=REGION)
 bq_client = bigquery.Client(project=PROJECT_ID)
 
 print(f"Streaming new telemetry vector directly to GCP table: {table_path}...")
-df.to_gbq(
+import pandas_gbq
+pandas_gbq.to_gbq(
+    df,
     destination_table=table_path,
     project_id=PROJECT_ID,
     if_exists="append"
