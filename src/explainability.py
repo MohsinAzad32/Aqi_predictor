@@ -134,14 +134,8 @@ print("Scaler loaded.")
 model_path = download_artifact("aqi_best_model.pkl")
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=UserWarning)
-    raw_model = pickle.load(open(model_path, "rb"))
-
-# Re-save and reload using XGBoost's native format to fix version mismatch
-native_path = ARTIFACTS / "aqi_best_model_native.json"
-raw_model.save_model(native_path)
-model = xgb.XGBRegressor()
-model.load_model(native_path)
-print("Model loaded via native XGBoost format.")
+    model = pickle.load(open(model_path, "rb"))
+print("Model loaded.")
 
 
 # ── 7. SCALE FEATURES ─────────────────────────────────────────────────────────
