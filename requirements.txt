@@ -1,0 +1,25 @@
+# Data & ML
+pandas
+numpy
+requests
+python-dotenv
+scikit-learn
+joblib
+
+# XGBoost + Explainability
+xgboost
+shap
+matplotlib
+
+# Visualization
+plotly
+
+# Google Cloud
+google-cloud-bigquery
+google-cloud-aiplatform
+pydata-google-auth
+db-dtypes
+pandas-gbq
+
+# Streamlit
+streamlit
