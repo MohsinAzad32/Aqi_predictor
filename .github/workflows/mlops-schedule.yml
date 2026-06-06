@@ -6,9 +6,17 @@ on:
     - cron: '0 0 * * *'  # Automatically triggers the model retraining query daily at midnight
   workflow_dispatch:     # Enables manual execution via the GitHub Repository Actions UI panel
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Fix Node.js 20 deprecation warning
+
 jobs:
   run-mlops-pipeline:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write  # Required for Workload Identity Federation
+
     steps:
     - name: Checkout Code Repository
       uses: actions/checkout@v4
@@ -24,7 +32,8 @@ jobs:
     - name: Secure Authentication to Google Cloud
       uses: google-github-actions/auth@v2
       with:
-        credentials_json: ${{ secrets.GCP_SA_KEY }}
+        workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+        service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
     - name: Execute Data Ingestion Pipeline
       if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 * * * *')
