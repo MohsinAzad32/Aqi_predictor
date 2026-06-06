@@ -37,6 +37,8 @@ jobs:
 
     - name: Execute Data Ingestion Pipeline
       if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 * * * *')
+      env:
+        OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
       run: python src/data_ingestion.py
 
     - name: Execute Model Retraining & Performance Evaluation
