@@ -142,16 +142,16 @@ print("Model loaded.")
 X = pd.DataFrame(scaler.transform(df[cols]), columns=cols)
 
 
-# ── 8. COMPUTE SHAP VALUES ────────────────────────────────────────────────────
+# ── 8. COMPUTE SHAP VALUES (TreeExplainer for XGBoost) ───────────────────────
 print("Computing SHAP values...")
-explainer   = shap.Explainer(model, X)
-shap_values = explainer(X)
+explainer   = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X)
 print("SHAP values computed.")
 
 
 # ── 9. PLOT & UPLOAD TO GCS ───────────────────────────────────────────────────
 plot_path = ARTIFACTS / "shap_summary.png"
-shap.summary_plot(shap_values, X, show=False)
+shap.summary_plot(shap_values, X, feature_names=cols, show=False)
 plt.savefig(plot_path, bbox_inches="tight", dpi=150)
 plt.close()
 print(f"Plot saved locally → {plot_path}")
@@ -159,3 +159,4 @@ print(f"Plot saved locally → {plot_path}")
 blob = bucket.blob(f"{GCS_PREFIX}/shap_summary.png")
 blob.upload_from_filename(plot_path)
 print(f"Plot uploaded to GCS → gs://{GCS_BUCKET}/{GCS_PREFIX}/shap_summary.png")
+print("Explainability pipeline completed successfully!")
