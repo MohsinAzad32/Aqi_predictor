@@ -8,6 +8,7 @@ import json, pickle, warnings
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import joblib
 import matplotlib
@@ -18,6 +19,21 @@ import pandas as pd
 import plotly.graph_objects as go
 import shap
 import streamlit as st
+
+# ─────────────────────────────────────────────────────────────
+# TIMEZONE  — Pakistan Standard Time (UTC+5, no DST)
+# ─────────────────────────────────────────────────────────────
+PKT = ZoneInfo("Asia/Karachi")
+
+def now_pkt():
+    return datetime.now(PKT)
+
+def to_pkt(ts):
+    """Convert any timestamp to PKT."""
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("Asia/Karachi")
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG  (must be first Streamlit call)
@@ -127,7 +143,6 @@ html, body, [class*="css"] {
 .legend-item { display:flex; align-items:center; gap:5px; font-size:0.72rem; color:#64748b; }
 .legend-dot { width:8px; height:8px; border-radius:2px; flex-shrink:0; }
 
-/* Source badge */
 .source-badge {
     display: inline-flex; align-items: center; gap: 5px;
     background: rgba(56,189,248,0.10); border: 1px solid rgba(56,189,248,0.2);
@@ -145,11 +160,13 @@ ARTIFACTS = ROOT / "artifacts"
 DATA_CSV  = ROOT / "data" / "multan_features.csv"
 
 # ─────────────────────────────────────────────────────────────
-# GCP CONFIGURATION  — edit these to match your project
+# GCP CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 GCP_PROJECT    = "pearl-aqi-predictor"
 GCP_REGION     = "us-central1"
-ENDPOINT_NAME  = "aqi-predictor-endpoint"   # Your Vertex AI endpoint display name
+GCS_BUCKET     = "pearl-aqi-predictor-artifacts"
+GCS_PREFIX     = "artifacts"
+ENDPOINT_NAME  = "aqi-predictor-endpoint"
 BQ_TABLE       = f"{GCP_PROJECT}.aqi_feature_store.multan_historical"
 
 # ─────────────────────────────────────────────────────────────
@@ -188,7 +205,7 @@ AQI_PLOTLY_ZONES = [
 ]
 
 # ─────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING  (matches training notebook exactly)
+# FEATURE ENGINEERING
 # ─────────────────────────────────────────────────────────────
 def build_features_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -227,71 +244,22 @@ def build_features_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.ffill().bfill().dropna().reset_index(drop=True)
 
 # ─────────────────────────────────────────────────────────────
-# VERTEX AI ONLINE PREDICTION
-# ─────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def get_vertex_endpoint():
-    """
-    Resolves the Vertex AI endpoint for online prediction.
-    Returns (endpoint_client, endpoint_resource_name) or (None, None).
-
-    This connects to your deployed model in the Vertex AI Model Registry.
-    The endpoint must be deployed at:
-      https://console.cloud.google.com/vertex-ai/endpoints
-    """
-    try:
-        from google.cloud import aiplatform
-        aiplatform.init(project=GCP_PROJECT, location=GCP_REGION)
-        endpoints = aiplatform.Endpoint.list(
-            filter=f'display_name="{ENDPOINT_NAME}"',
-            order_by="create_time desc",
-        )
-        if not endpoints:
-            return None, None
-        ep = endpoints[0]
-        return ep, ep.resource_name
-    except Exception as e:
-        return None, str(e)
-
-
-def predict_via_vertex(endpoint, feature_rows: list[dict], feature_cols: list[str]) -> list[float]:
-    """
-    Sends a batch of feature rows to the Vertex AI endpoint and returns predictions.
-
-    Args:
-        endpoint:      aiplatform.Endpoint object
-        feature_rows:  list of dicts, one per timestep
-        feature_cols:  ordered list of feature names matching training order
-
-    Returns:
-        list of float AQI predictions
-    """
-    # Build instances in the format Vertex AI expects (list of dicts or list of lists)
-    instances = []
-    for row in feature_rows:
-        instance = {col: float(row.get(col, 0.0)) for col in feature_cols}
-        instances.append(instance)
-
-    response = endpoint.predict(instances=instances)
-    # Vertex AI returns predictions as a list; handle both scalar and nested list
-    preds = []
-    for p in response.predictions:
-        if isinstance(p, (list, tuple)):
-            preds.append(float(p[0]))
-        else:
-            preds.append(float(p))
-    return preds
-
-
-# ─────────────────────────────────────────────────────────────
-# LOCAL MODEL FALLBACK (artifacts/*.pkl)
+# LOCAL ARTIFACTS — load from GCS first, fallback to local
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_local_artifacts():
-    """
-    Loads the locally saved XGBoost model and scaler from the artifacts/ directory.
-    Used as a fallback when Vertex AI is unavailable.
-    """
+    """Load model/scaler/features from GCS, fallback to local files."""
+    try:
+        from google.cloud import storage
+        gcs = storage.Client(project=GCP_PROJECT)
+        bucket = gcs.bucket(GCS_BUCKET)
+        ARTIFACTS.mkdir(exist_ok=True)
+        for fname in ["aqi_best_model.pkl", "aqi_scaler.joblib", "feature_cols.json"]:
+            blob = bucket.blob(f"{GCS_PREFIX}/{fname}")
+            blob.download_to_filename(ARTIFACTS / fname)
+    except Exception:
+        pass  # fall through to local files
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
         model = pickle.load(open(ARTIFACTS / "aqi_best_model.pkl", "rb"))
@@ -323,29 +291,46 @@ def load_local_artifacts():
 
 
 # ─────────────────────────────────────────────────────────────
-# UNIFIED MODEL LOADER
-# Returns (predict_fn, feature_cols, model_source_label)
-# predict_fn(feature_rows) -> list[float]
+# VERTEX AI ENDPOINT
+# ─────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_vertex_endpoint():
+    try:
+        from google.cloud import aiplatform
+        aiplatform.init(project=GCP_PROJECT, location=GCP_REGION)
+        endpoints = aiplatform.Endpoint.list(
+            filter=f'display_name="{ENDPOINT_NAME}"',
+            order_by="create_time desc",
+        )
+        if not endpoints:
+            return None, None
+        ep = endpoints[0]
+        return ep, ep.resource_name
+    except Exception as e:
+        return None, str(e)
+
+
+def predict_via_vertex(endpoint, feature_rows, feature_cols):
+    instances = []
+    for row in feature_rows:
+        instance = {col: float(row.get(col, 0.0)) for col in feature_cols}
+        instances.append(instance)
+    response = endpoint.predict(instances=instances)
+    preds = []
+    for p in response.predictions:
+        preds.append(float(p[0]) if isinstance(p, (list, tuple)) else float(p))
+    return preds
+
+
+# ─────────────────────────────────────────────────────────────
+# UNIFIED MODEL RESOLVER
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def resolve_model():
-    """
-    Priority order:
-      1. Vertex AI deployed endpoint (real-time, always the latest trained model)
-      2. Local artifact file (aqi_best_model.pkl) — offline fallback
-
-    Returns:
-        predict_fn    : callable(feature_rows: list[dict]) -> list[float]
-        feature_cols  : list[str]
-        source_label  : str shown in UI badge
-    """
     endpoint, ep_name = get_vertex_endpoint()
-
     if endpoint is not None:
         _, scaler, feature_cols = load_local_artifacts()
-
-        def vertex_predict(feature_rows: list[dict]) -> list[float]:
-            """Scale features locally, then call Vertex AI for inference."""
+        def vertex_predict(feature_rows):
             df_in = pd.DataFrame(feature_rows)
             for col in feature_cols:
                 if col not in df_in.columns:
@@ -357,36 +342,24 @@ def resolve_model():
                 for i in range(len(scaled))
             ]
             return predict_via_vertex(endpoint, scaled_rows, feature_cols)
-
         return vertex_predict, feature_cols, "Vertex AI (Live)"
 
-    # Fallback: local pkl model
     model, scaler, feature_cols = load_local_artifacts()
-
-    def local_predict(feature_rows: list[dict]) -> list[float]:
+    def local_predict(feature_rows):
         df_in = pd.DataFrame(feature_rows)
         for col in feature_cols:
             if col not in df_in.columns:
                 df_in[col] = 0.0
         df_in = df_in[feature_cols]
         return list(model.predict(scaler.transform(df_in)).astype(float))
-
     return local_predict, feature_cols, "Local Artifact (Offline)"
 
 
 # ─────────────────────────────────────────────────────────────
-# DATA SOURCE  (BigQuery real-time → local CSV → demo)
+# DATA SOURCE — BigQuery (PKT timestamps) → local CSV → demo
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_data():
-    """
-    Attempts to load the most recent 500 rows of air quality data:
-      1. BigQuery (real-time pipeline data)
-      2. Local CSV  (last exported snapshot)
-      3. Synthetic demo data  (realistic Multan values)
-
-    The timestamp shown in the UI reflects the ACTUAL last data point.
-    """
     # ── 1. BigQuery ──────────────────────────────────────────
     try:
         from google.cloud import bigquery
@@ -400,7 +373,7 @@ def load_data():
             ORDER BY timestamp DESC LIMIT 500
         """
         df = client.query(q).to_dataframe()
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Karachi").dt.tz_localize(None)
         return df.sort_values("timestamp").reset_index(drop=True), "BigQuery (Real-Time)"
     except Exception:
         pass
@@ -410,8 +383,7 @@ def load_data():
         df = pd.read_csv(DATA_CSV)
         if "timestamp" not in df.columns:
             df["timestamp"] = pd.to_datetime(
-                df.get("dt", df.index),
-                unit="s" if "dt" in df.columns else None
+                df.get("dt", df.index), unit="s" if "dt" in df.columns else None
             )
         else:
             df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -420,7 +392,7 @@ def load_data():
         return df.sort_values("timestamp").reset_index(drop=True), "Local CSV (Cached)"
 
     # ── 3. Demo data ─────────────────────────────────────────
-    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    now = now_pkt().replace(minute=0, second=0, microsecond=0, tzinfo=None)
     timestamps = [now - timedelta(hours=i) for i in range(199, -1, -1)]
     np.random.seed(42)
     base = 165 + 15*np.sin(np.linspace(0, 4*np.pi, 200)) + np.random.normal(0, 8, 200)
@@ -441,13 +413,6 @@ def load_data():
 # 72-HOUR RECURSIVE FORECAST
 # ─────────────────────────────────────────────────────────────
 def generate_forecast(raw_df, predict_fn, feature_cols, hours=72):
-    """
-    Generates a 72-step recursive AQI forecast using the resolved model
-    (either Vertex AI endpoint or local artifact).
-
-    Each predicted step feeds back into the next step's lag features,
-    enabling multi-step-ahead forecasting without a retraining loop.
-    """
     tail   = raw_df.sort_values("timestamp").tail(200)
     aqi_q  = deque(tail["aqi"].tolist(),   maxlen=200)
     pm25_q = deque(tail["pm2_5"].tolist(), maxlen=200)
@@ -455,7 +420,6 @@ def generate_forecast(raw_df, predict_fn, feature_cols, hours=72):
     last_row = tail.iloc[-1]
     last_ts  = pd.Timestamp(last_row["timestamp"])
     forecasts = []
-    batch_rows = []
 
     for h in range(1, hours + 1):
         ts = last_ts + timedelta(hours=h)
@@ -493,7 +457,6 @@ def generate_forecast(raw_df, predict_fn, feature_cols, hours=72):
         m = ts.month
         row["season"] = 0 if m in [12,1,2] else 1 if m in [3,4,5] else 2 if m in [6,7,8] else 3
 
-        # Predict one step at a time (must be recursive)
         pred = float(predict_fn([row])[0])
         pred = max(0.0, min(pred, 500.0))
         forecasts.append({"timestamp": ts, "aqi": pred})
@@ -503,7 +466,7 @@ def generate_forecast(raw_df, predict_fn, feature_cols, hours=72):
 
 
 # ─────────────────────────────────────────────────────────────
-# SHAP COMPUTATION  (always uses local model for explainability)
+# SHAP
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def compute_shap(_model, _scaler, _feature_cols, _raw_df):
@@ -543,7 +506,7 @@ def compute_shap(_model, _scaler, _feature_cols, _raw_df):
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPER — Plotly dark layout
+# PLOTLY DARK LAYOUT
 # ─────────────────────────────────────────────────────────────
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -568,12 +531,13 @@ with st.spinner(""):
     raw_df, data_source = load_data()
     local_model, local_scaler, _ = load_local_artifacts()
 
-# Current values from latest data point
 latest       = raw_df.iloc[-1]
 current_aqi  = int(latest["aqi"])
 current_info = get_aqi_info(current_aqi)
-# ── KEY FIX: always show the ACTUAL timestamp from the data ──
-last_updated = pd.to_datetime(latest["timestamp"]).strftime("%d %b %Y, %H:%M")
+
+# ── FIXED: show PKT time correctly ──
+last_ts_pkt  = pd.Timestamp(latest["timestamp"])  # already in PKT from load_data()
+last_updated = last_ts_pkt.strftime("%d %b %Y, %H:%M PKT")
 
 pollutants = {
     "PM2.5": (float(latest.get("pm2_5", 0)), 75,  "μg/m³", "#f59e0b"),
@@ -584,13 +548,11 @@ pollutants = {
     "CO"   : (float(latest.get("co",    0)), 4,   "mg/m³", "#f97316"),
 }
 
-# ── 72-hour forecast via resolved model (Vertex AI or local) ──
 with st.spinner("Generating 72-hour forecast…"):
     forecast_df = generate_forecast(raw_df, predict_fn, feature_cols, hours=72)
 
-# Day summaries
 def day_summary(df, day_offset):
-    base  = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    base  = now_pkt().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     start = base + timedelta(days=day_offset)
     end   = start + timedelta(days=1)
     sub   = df[(df["timestamp"] >= start) & (df["timestamp"] < end)]
@@ -605,7 +567,7 @@ day2 = day_summary(forecast_df, 2)
 day3 = day_summary(forecast_df, 3)
 
 # ─────────────────────────────────────────────────────────────
-# ── HEADER
+# HEADER
 # ─────────────────────────────────────────────────────────────
 hcol1, hcol2 = st.columns([3, 1], gap="large")
 with hcol1:
@@ -614,12 +576,9 @@ with hcol1:
     <p class="page-sub">Real-time monitoring · 72-hour ML forecast · SHAP explainability</p>
     """, unsafe_allow_html=True)
 with hcol2:
-    # ── SOURCE BADGES — shows REAL source, never misleading text ──
-    is_live = "BigQuery" in data_source or "Vertex" in model_source
-    pill_class = "status-live" if is_live else "status-fallback"
-    dot_class  = "dot-green"  if is_live else "dot-amber"
-
-    # Data timestamp exactly from the data
+    is_live    = "BigQuery" in data_source or "Vertex" in model_source
+    pill_class = "status-live"    if is_live else "status-fallback"
+    dot_class  = "dot-green"      if is_live else "dot-amber"
     st.markdown(f"""
     <div style="text-align:right; padding-top:6px;">
         <div class="status-pill {pill_class}">
@@ -636,7 +595,7 @@ with hcol2:
 st.markdown('<hr class="hdivider">', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# ── ROW 1: AQI GAUGE  +  ALERT  +  POLLUTANTS
+# ROW 1: GAUGE + ALERT + POLLUTANTS
 # ─────────────────────────────────────────────────────────────
 col_gauge, col_alert, col_poll = st.columns([1.1, 1.5, 1.4], gap="large")
 
@@ -690,8 +649,7 @@ with col_alert:
         <p class="alert-msg">{current_info['message']}</p>
     </div>
     """, unsafe_allow_html=True)
-    st.markdown('<p class="metric-label" style="margin-top:20px;">72h outlook</p>',
-                unsafe_allow_html=True)
+    st.markdown('<p class="metric-label" style="margin-top:20px;">72h outlook</p>', unsafe_allow_html=True)
     avg_72 = forecast_df["aqi"].mean()
     mx_72  = forecast_df["aqi"].max()
     mn_72  = forecast_df["aqi"].min()
@@ -712,8 +670,7 @@ with col_alert:
 with col_poll:
     st.markdown('<div class="aqi-card" style="height:100%;">', unsafe_allow_html=True)
     st.markdown('<p class="section-title">Pollutant Levels</p>', unsafe_allow_html=True)
-    st.markdown('<p class="metric-label" style="margin-bottom:14px;">Current concentrations vs WHO guidelines</p>',
-                unsafe_allow_html=True)
+    st.markdown('<p class="metric-label" style="margin-bottom:14px;">Current concentrations vs WHO guidelines</p>', unsafe_allow_html=True)
     for name, (val, limit, unit, color) in pollutants.items():
         pct = min(val / limit * 100, 100)
         bar_color = color if pct < 80 else "#ef4444"
@@ -731,7 +688,7 @@ with col_poll:
 st.markdown('<hr class="hdivider">', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# ── ROW 2: 72-HOUR FORECAST CHART
+# ROW 2: 72-HOUR FORECAST CHART
 # ─────────────────────────────────────────────────────────────
 st.markdown('<p class="section-title">72-Hour AQI Forecast</p>', unsafe_allow_html=True)
 st.markdown("""
@@ -761,10 +718,10 @@ forecast_fig.add_trace(go.Scatter(
     marker=dict(size=5, color=fdf["aqi"].apply(lambda x: get_aqi_info(x)["color"]),
                 line=dict(width=1, color="#0a0f1e")),
     showlegend=False,
-    hovertemplate="<b>%{x|%a %d %b %H:%M}</b><br>AQI: <b>%{y:.0f}</b><extra></extra>",
+    hovertemplate="<b>%{x|%a %d %b %H:%M} PKT</b><br>AQI: <b>%{y:.0f}</b><extra></extra>",
 ))
 for day in range(1, 4):
-    day_ts = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=day)
+    day_ts = now_pkt().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None) + timedelta(days=day)
     forecast_fig.add_vline(x=day_ts, line_dash="dot", line_color="rgba(255,255,255,0.12)",
                            line_width=1, annotation_text=f"Day {day}",
                            annotation_font=dict(color="#475569", size=10),
@@ -773,18 +730,18 @@ forecast_fig.update_layout(**pl(
     height=280, margin=dict(l=12, r=12, t=36, b=12),
     shapes=AQI_PLOTLY_ZONES,
     yaxis=dict(**PLOTLY_LAYOUT["yaxis"], title="AQI", range=[0, max(fdf["aqi"].max()*1.1, 200)]),
-    xaxis=dict(**PLOTLY_LAYOUT["xaxis"], title=""),
+    xaxis=dict(**PLOTLY_LAYOUT["xaxis"], title="Pakistan Standard Time (PKT)"),
     hovermode="x unified",
 ))
 st.plotly_chart(forecast_fig, use_container_width=True, config={"displayModeBar": False})
 
 # ─────────────────────────────────────────────────────────────
-# ── ROW 3: DAY SUMMARY CARDS
+# ROW 3: DAY SUMMARY CARDS
 # ─────────────────────────────────────────────────────────────
 day_labels = [
-    (datetime.now() + timedelta(days=1)).strftime("Tomorrow · %a %d %b"),
-    (datetime.now() + timedelta(days=2)).strftime("Day 2 · %a %d %b"),
-    (datetime.now() + timedelta(days=3)).strftime("Day 3 · %a %d %b"),
+    (now_pkt() + timedelta(days=1)).strftime("Tomorrow · %a %d %b"),
+    (now_pkt() + timedelta(days=2)).strftime("Day 2 · %a %d %b"),
+    (now_pkt() + timedelta(days=3)).strftime("Day 3 · %a %d %b"),
 ]
 dcols = st.columns(3, gap="medium")
 for col, label, summary in zip(dcols, day_labels, [day1, day2, day3]):
@@ -809,7 +766,7 @@ for col, label, summary in zip(dcols, day_labels, [day1, day2, day3]):
 st.markdown('<hr class="hdivider">', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# ── ROW 4: HISTORICAL TREND  +  HOURLY HEATMAP
+# ROW 4: HISTORICAL TREND + HOURLY HEATMAP
 # ─────────────────────────────────────────────────────────────
 hist_col, heat_col = st.columns([1.6, 1], gap="large")
 
@@ -822,13 +779,13 @@ with hist_col:
         mode="lines", line=dict(color="#38bdf8", width=1.5),
         fill="tozeroy", fillcolor="rgba(56,189,248,0.06)",
         name="Observed AQI",
-        hovertemplate="<b>%{x|%d %b %H:%M}</b><br>AQI: <b>%{y}</b><extra></extra>",
+        hovertemplate="<b>%{x|%d %b %H:%M} PKT</b><br>AQI: <b>%{y}</b><extra></extra>",
     ))
     hist_fig.update_layout(**pl(
         height=230, margin=dict(l=12, r=12, t=12, b=12),
         shapes=AQI_PLOTLY_ZONES,
         yaxis=dict(**PLOTLY_LAYOUT["yaxis"], title="AQI"),
-        xaxis=dict(**PLOTLY_LAYOUT["xaxis"]),
+        xaxis=dict(**PLOTLY_LAYOUT["xaxis"], title="Pakistan Standard Time (PKT)"),
     ))
     st.plotly_chart(hist_fig, use_container_width=True, config={"displayModeBar": False})
 
@@ -849,7 +806,7 @@ with heat_col:
             [0.5, "#FF0000"],[0.75,"#8F3F97"],[1.0, "#7E0023"]
         ],
         zmin=0, zmax=300, showscale=True,
-        hovertemplate="<b>%{y} %{x}</b><br>Avg AQI: <b>%{z:.0f}</b><extra></extra>",
+        hovertemplate="<b>%{y} %{x} PKT</b><br>Avg AQI: <b>%{z:.0f}</b><extra></extra>",
         colorbar=dict(thickness=10, outlinewidth=0, tickfont=dict(color="#475569", size=9)),
     ))
     heat_fig.update_layout(**pl(
@@ -863,10 +820,9 @@ with heat_col:
 st.markdown('<hr class="hdivider">', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# ── ROW 5: SHAP EXPLAINABILITY
+# ROW 5: SHAP EXPLAINABILITY
 # ─────────────────────────────────────────────────────────────
-st.markdown('<p class="section-title">Model Explainability — SHAP Feature Importance</p>',
-            unsafe_allow_html=True)
+st.markdown('<p class="section-title">Model Explainability — SHAP Feature Importance</p>', unsafe_allow_html=True)
 st.markdown('<p style="font-size:0.82rem; color:#475569; margin:-2px 0 16px;">'
             'SHAP values show each feature\'s contribution to the AQI prediction. '
             'Red = increases AQI · Blue = decreases AQI.</p>', unsafe_allow_html=True)
@@ -881,8 +837,7 @@ with shap_img_col:
         st.info("SHAP plot unavailable — run explainability.py to generate it.")
 
 with shap_tbl_col:
-    st.markdown('<p class="section-title" style="font-size:0.9rem;">Top Contributing Features</p>',
-                unsafe_allow_html=True)
+    st.markdown('<p class="section-title" style="font-size:0.9rem;">Top Contributing Features</p>', unsafe_allow_html=True)
     if top_feats:
         max_val = top_feats[0][1] if top_feats else 1
         for rank, (fname, importance) in enumerate(top_feats, 1):
@@ -896,8 +851,7 @@ with shap_tbl_col:
                     <span style="font-size:0.78rem; color:#475569;">{importance:.3f}</span>
                 </div>
                 <div style="background:#1e293b; border-radius:3px; height:6px;">
-                    <div style="width:{pct:.0f}%; height:100%; background:{bar_col};
-                                border-radius:3px;"></div>
+                    <div style="width:{pct:.0f}%; height:100%; background:{bar_col}; border-radius:3px;"></div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -914,7 +868,7 @@ with shap_tbl_col:
         """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# ── FOOTER
+# FOOTER
 # ─────────────────────────────────────────────────────────────
 st.markdown('<hr class="hdivider">', unsafe_allow_html=True)
 st.markdown(f"""
@@ -924,7 +878,7 @@ st.markdown(f"""
         XGBoost R²=0.989 · Inference: {model_source} · Data: {data_source}
     </span>
     <span style="font-size:0.75rem; color:#334155;">
-        AQI scale follows EPA standard · 72-hour recursive ML forecast
+        AQI scale follows EPA standard · 72-hour recursive ML forecast · All times in PKT (UTC+5)
     </span>
 </div>
 """, unsafe_allow_html=True)
