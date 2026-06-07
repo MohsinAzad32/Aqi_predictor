@@ -1,6 +1,7 @@
 """
 Explains an AQI prediction model using SHAP values.
 Reads data from BigQuery, engineers features, and generates a summary plot.
+Skips gracefully if not enough data has accumulated yet.
 """
 
 import json, pickle, warnings
@@ -22,6 +23,7 @@ DATASET_ID  = "aqi_feature_store"
 TABLE_ID    = "multan_historical"
 GCS_BUCKET  = "pearl-aqi-predictor-artifacts"
 GCS_PREFIX  = "artifacts"
+MIN_ROWS    = 80   # need at least 80 rows for lag-72h + rolling-24h features
 
 ROOT        = Path(__file__).resolve().parent.parent
 ARTIFACTS   = ROOT / "artifacts"
@@ -38,6 +40,14 @@ query = f"""
 df = bq_client.query(query).to_dataframe()
 print(f"Raw data loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 print(f"Columns: {list(df.columns)}")
+
+# ── EARLY EXIT: not enough raw rows yet ───────────────────────────────────────
+if len(df) < MIN_ROWS:
+    print(f"\n⏳ Not enough data yet ({len(df)}/{MIN_ROWS} rows needed).")
+    print(f"   Explainability will run automatically once {MIN_ROWS} hours of data accumulate.")
+    print(f"   Estimated time: ~{MIN_ROWS - len(df)} more hours.")
+    print("Skipping — exiting cleanly.")
+    exit(0)
 
 
 # ── 2. FEATURE ENGINEERING ────────────────────────────────────────────────────
@@ -100,6 +110,13 @@ df["season"] = df["month"].map(
 df = df.dropna().tail(500).reset_index(drop=True)
 print(f"After feature engineering: {df.shape[0]} rows, {df.shape[1]} columns")
 
+# ── SECOND CHECK: enough rows after feature engineering ───────────────────────
+if len(df) < 10:
+    print(f"\n⏳ Only {len(df)} rows remain after feature engineering (need 10+).")
+    print("   More data needed — skipping SHAP computation for now.")
+    print("Skipping — exiting cleanly.")
+    exit(0)
+
 
 # ── 3. LOAD ARTIFACTS FROM GCS ────────────────────────────────────────────────
 print("Downloading artifacts from Google Cloud Storage...")
@@ -142,7 +159,7 @@ print("Model loaded.")
 X = pd.DataFrame(scaler.transform(df[cols]), columns=cols)
 
 
-# ── 8. COMPUTE SHAP VALUES (TreeExplainer for XGBoost) ───────────────────────
+# ── 8. COMPUTE SHAP VALUES (TreeExplainer for XGBoost) ────────────────────────
 print("Computing SHAP values...")
 explainer   = shap.TreeExplainer(model)
 shap_values = explainer.shap_values(X)
