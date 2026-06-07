@@ -18,8 +18,9 @@ if not API_KEY:
 
 # ─────────────────────────────────────────────────────────────
 # 2. EPA AQI Calculator
-# Converts raw pollutant concentrations → official EPA AQI (0–500)
-# This is the same formula used by AirNow, IQAir, and EPA itself
+# OpenWeather units:
+#   pm2_5, pm10, no2, so2, o3 → μg/m³
+#   co                        → μg/m³  ← NOT mg/m³ !
 # ─────────────────────────────────────────────────────────────
 def calculate_epa_aqi(pm25=None, pm10=None, no2=None, o3=None, so2=None, co=None):
     """
@@ -32,13 +33,13 @@ def calculate_epa_aqi(pm25=None, pm10=None, no2=None, o3=None, so2=None, co=None
     def aqi_pm25(c):
         """PM2.5 in μg/m³"""
         bp = [
-            (0.0,   12.0,   0,   50),
-            (12.1,  35.4,  51,  100),
-            (35.5,  55.4, 101,  150),
-            (55.5, 150.4, 151,  200),
-            (150.5,250.4, 201,  300),
-            (250.5,350.4, 301,  400),
-            (350.5,500.4, 401,  500),
+            (0.0,   12.0,   0,  50),
+            (12.1,  35.4,  51, 100),
+            (35.5,  55.4, 101, 150),
+            (55.5, 150.4, 151, 200),
+            (150.5,250.4, 201, 300),
+            (250.5,350.4, 301, 400),
+            (350.5,500.4, 401, 500),
         ]
         for lo, hi, alo, ahi in bp:
             if lo <= c <= hi:
@@ -62,7 +63,7 @@ def calculate_epa_aqi(pm25=None, pm10=None, no2=None, o3=None, so2=None, co=None
         return 500
 
     def aqi_no2(c):
-        """NO2 in μg/m³ → convert to ppb (1 ppb = 1.88 μg/m³)"""
+        """NO2 in μg/m³ → ppb (divide by 1.88)"""
         c = c / 1.88
         bp = [
             (0,    53,   0,  50),
@@ -79,7 +80,7 @@ def calculate_epa_aqi(pm25=None, pm10=None, no2=None, o3=None, so2=None, co=None
         return 500
 
     def aqi_o3(c):
-        """O3 in μg/m³ → convert to ppb (1 ppb = 1.96 μg/m³)"""
+        """O3 in μg/m³ → ppb (divide by 1.96)"""
         c = c / 1.96
         bp = [
             (0,   54,   0,  50),
@@ -94,7 +95,7 @@ def calculate_epa_aqi(pm25=None, pm10=None, no2=None, o3=None, so2=None, co=None
         return 300
 
     def aqi_so2(c):
-        """SO2 in μg/m³ → convert to ppb (1 ppb = 2.62 μg/m³)"""
+        """SO2 in μg/m³ → ppb (divide by 2.62)"""
         c = c / 2.62
         bp = [
             (0,   35,   0,  50),
@@ -111,8 +112,13 @@ def calculate_epa_aqi(pm25=None, pm10=None, no2=None, o3=None, so2=None, co=None
         return 500
 
     def aqi_co(c):
-        """CO in mg/m³ → convert to ppm (1 ppm = 1.145 mg/m³)"""
-        c = c / 1.145
+        """
+        CO from OpenWeather is in μg/m³
+        Step 1: μg/m³ → mg/m³ (divide by 1000)
+        Step 2: mg/m³ → ppm  (divide by 1.145)
+        """
+        c = c / 1000    # ← KEY FIX: μg/m³ to mg/m³
+        c = c / 1.145   # mg/m³ to ppm
         bp = [
             (0,    4.4,   0,  50),
             (4.5,  9.4,  51, 100),
@@ -168,11 +174,12 @@ available_columns = [col for col in core_columns if col in df.columns]
 df = df[available_columns]
 
 # ─────────────────────────────────────────────────────────────
-# 5. Replace OpenWeather 1–5 AQI with EPA AQI (0–500)
-# OpenWeather returns AQI on a 1–5 scale which is NOT compatible
-# with our model trained on EPA AQI (0–500 scale)
+# 5. Replace OpenWeather 1–5 AQI with proper EPA AQI (0–500)
 # ─────────────────────────────────────────────────────────────
 print(f"OpenWeather raw AQI (1-5 scale): {df['aqi'].values[0]}")
+print(f"Raw pollutants → PM2.5:{df['pm2_5'].values[0]:.1f} PM10:{df['pm10'].values[0]:.1f} "
+      f"NO2:{df['no2'].values[0]:.1f} O3:{df['o3'].values[0]:.1f} "
+      f"SO2:{df['so2'].values[0]:.1f} CO:{df['co'].values[0]:.1f} μg/m³")
 
 df["aqi"] = df.apply(lambda row: calculate_epa_aqi(
     pm25=row.get("pm2_5"),
@@ -189,8 +196,6 @@ print(df)
 
 # ─────────────────────────────────────────────────────────────
 # 6. Stream to BigQuery
-# Uses Application Default Credentials (ADC) automatically
-# Works locally (gcloud auth) and in CI/CD (WIF token)
 # ─────────────────────────────────────────────────────────────
 PROJECT_ID = "pearl-aqi-predictor"
 REGION     = "us-central1"
@@ -202,7 +207,7 @@ print("\nConnecting to Google Cloud Platform via Application Default Credentials
 aiplatform.init(project=PROJECT_ID, location=REGION)
 bq_client = bigquery.Client(project=PROJECT_ID)
 
-print(f"Streaming new telemetry vector directly to GCP table: {table_path}...")
+print(f"Streaming to GCP table: {table_path}...")
 pandas_gbq.to_gbq(
     df,
     destination_table=table_path,
@@ -210,4 +215,4 @@ pandas_gbq.to_gbq(
     if_exists="append"
 )
 
-print(f"Success! Ingestion task finished. EPA AQI={df['aqi'].values[0]} appended to BigQuery.")
+print(f"Success! EPA AQI={df['aqi'].values[0]} appended to BigQuery.")
