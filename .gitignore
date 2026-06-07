@@ -11,6 +11,7 @@ src/tests/__pycache__/
 
 # Local Data Drops
 data/multan_features.csv
+src/backfill.py
 
 # Local Model Binaries (BigQuery ML handles this in production now)
 artifacts/aqi_best_model.pkl
